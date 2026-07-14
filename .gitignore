@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 生成的数据/特征/模型（训练时现算现产，不入库）
+*.npy
+*.csv
+*.pth
+X_feat_cache*
+data/
+org_v1.*

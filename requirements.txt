@@ -1,0 +1,18 @@
+# 精简依赖：只保留「BTC 数据采集 + CNN_Transformer/UD 训练」所需。
+# 训练建议在带 CUDA GPU 的环境（如 Kaggle Notebook）中运行。
+
+# 数据采集
+requests>=2.32
+
+# 数据处理 / 特征
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+# 注: GASF 用闭式解在 torch 中按 batch 现算(见 gaf_transform.py)，无需 pyts
+
+# 训练
+torch>=2.4           # GPU 环境请安装对应 CUDA 版 (如 torch==2.10.0+cu126)
+scikit-learn>=1.5    # r2_score
+
+# 可视化（UD/NK.py 重建对比图，可选）
+matplotlib>=3.8
