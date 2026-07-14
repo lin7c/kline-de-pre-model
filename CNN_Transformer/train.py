@@ -62,7 +62,7 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
 
     # 2. 模型、优化器、损失
     model = GafCnnTransformer(output_dim=output_dim).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)  # 加大 weight_decay 抑制过拟合(P0-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
     criterion = nn.HuberLoss(delta=1.0)  # 在标准化空间建议使用 1.0 左右
 
