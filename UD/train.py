@@ -168,5 +168,6 @@ if __name__ == "__main__":
         X_FILE="../CNN/input_x_v1.npy",
         DCT_FILE="../CNN_Transformer/y_transformer_v1_g.npy",
         DELTA_FILE="y_delta_ohlc.npy",
-        PRETRAINED_T_MODEL="../CNN_Transformer/transformer_dct_v1.pth"
+        PRETRAINED_T_MODEL="../CNN_Transformer/transformer_dct_v1.pth",
+        epochs=int(os.environ.get("UD_EPOCHS", 10000))  # 可用环境变量限制轮次(测试用)
     )

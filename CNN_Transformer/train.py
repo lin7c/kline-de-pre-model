@@ -161,7 +161,7 @@ def run():
         "X_FILE": "../CNN/input_x_v1.npy",  # 原始窗口(N,60,12)，GASF 训练时现算
         "Y_FILE": "y_transformer_v1.npy",
         "output_dim": 9,
-        "epochs": 10000
+        "epochs": int(os.environ.get("CT_EPOCHS", 10000))  # 可用环境变量限制轮次(测试用)
     }
     train_model(**CONFIG)
 
