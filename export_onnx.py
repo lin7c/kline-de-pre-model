@@ -54,6 +54,7 @@ def export_transformer(ckpt_path, out_path):
         },
         opset_version=17,
         do_constant_folding=True,
+        dynamo=False,   # 用传统 TorchScript 导出器：可靠地保留 output_names 契约，且不依赖 onnxscript
     )
     print(f"✅ 已导出: {out_path}")
 
