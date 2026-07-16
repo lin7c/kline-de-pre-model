@@ -4,15 +4,24 @@
 数据源与 kline-de-pre 主项目一致：OKX BTC-USDT。训练一律在 Kaggle 等 GPU 环境
 现拉现训，本地不再累积/保存任何训练数据。
 
+多尺度窗口（v2，真·三时间尺度）：
+  旧版把 5m/15m merge_asof 到 1m 时间轴，一个 60 分钟窗口里 5m 只有 12 个不同值、
+  15m 只有 4 个——模型实际只看到 1 小时历史，却要预测未来 15 小时（标签 gap_15m=900），
+  信息严重不对称。v2 改为每个样本包含三个「独立 60 根」窗口，右端对齐同一分钟 t：
+    1m : t-59 .. t                （1 小时）
+    5m : 60 个滚动 5 分钟块，块右端为 t, t-5, ..., t-295   （5 小时）
+    15m: 60 个滚动 15 分钟块，块右端为 t, t-15, ..., t-885 （15 小时）
+  「滚动块」= 以当前分钟为右端的 trailing 聚合（open=块首开、high/low=块内极值、close=当前收），
+  只用 t 及更早的数据，无未来函数；推理端可从 900 根 1m 精确复现（见 src/utils/gafService.js）。
+
 流程：
   从 OKX history-candles 分页拉取 1m（默认拉到历史尽头 = 能拿到的最多）
-    -> 重采样出 5m / 15m（左边界，与原 MT5 bar 开盘时间语义一致）
-    -> merge_asof(backward) 对齐到 1m 时间轴（防未来函数）
-    -> (N, 60, 12) 滑动窗口（步长固定为 1，保证下游未来标签的分钟语义正确）
+    -> 滚动聚合出 5m / 15m trailing 块
+    -> 组装 (N, 60, 12) 多尺度窗口（每根 1m 一个样本，需 >=900 根历史）
 
-输出（与原实现一致）：
-  org_v1.csv  列: time,1m_open/high/low/close,5m_...,15m_...
-  org_v1.npy  形状: (num_windows, 60, 12) float32
+输出：
+  org_v1.csv  列: time, 1m_open/high/low/close, 5m_..., 15m_...（5m/15m 为右端在该分钟的滚动块）
+  org_v1.npy  形状: (num_windows, 60, 12) float32，通道顺序 [1m OHLC, 5m OHLC, 15m OHLC]
 
 用法:
   python getdata_btc.py                # 拉到历史尽头（最多）
@@ -26,6 +35,7 @@ import pandas as pd
 import requests
 
 WINDOW_SIZE = 60
+LOOKBACK = 900          # 15m 窗口需要的最大 1m 回看（15*59+15）
 OKX_BASE = "https://www.okx.com"
 PAGE_LIMIT = 100  # OKX history-candles 单次上限
 
@@ -87,55 +97,72 @@ def fetch_okx_1m(inst_id, max_bars):
     return df
 
 
-def resample_tf(df_1m, rule, prefix):
-    s = df_1m.set_index("time")
-    agg = s.resample(rule, closed="left", label="left").agg(
-        **{
-            f"{prefix}_open": ("1m_open", "first"),
-            f"{prefix}_high": ("1m_high", "max"),
-            f"{prefix}_low": ("1m_low", "min"),
-            f"{prefix}_close": ("1m_close", "last"),
-        }
-    ).dropna().reset_index()
-    return agg
+def trailing_blocks(df_1m, period, prefix):
+    """以每根 1m 为右端的 trailing `period` 分钟聚合块（只看当前及更早，无未来函数）。
+
+    返回 (T, 4) float32: [open, high, low, close]，前 period-1 行为 NaN。
+    """
+    o = df_1m["1m_open"]
+    h = df_1m["1m_high"].rolling(period).max()
+    l = df_1m["1m_low"].rolling(period).min()
+    blk = pd.DataFrame({
+        f"{prefix}_open": o.shift(period - 1),   # 块首那根的开盘
+        f"{prefix}_high": h,
+        f"{prefix}_low": l,
+        f"{prefix}_close": df_1m["1m_close"],    # 块右端 = 当前收盘
+    })
+    return blk
 
 
-def build_aligned(df_1m):
-    print("🔄 重采样 5m / 15m 并跨周期对齐...")
-    df_5m = resample_tf(df_1m, "5min", "5m")
-    df_15m = resample_tf(df_1m, "15min", "15m")
-    combined = pd.merge_asof(df_1m, df_5m, on="time", direction="backward")
-    combined = pd.merge_asof(combined, df_15m, on="time", direction="backward")
+def build_multi_scale(df_1m):
+    """组装逐分钟特征矩阵 F (T, 12) 与时间列：[1m OHLC, 5m块 OHLC, 15m块 OHLC]。"""
+    print("🔄 计算 trailing 5m / 15m 滚动块...")
+    blk5 = trailing_blocks(df_1m, 5, "5m")
+    blk15 = trailing_blocks(df_1m, 15, "15m")
+    combined = pd.concat([df_1m.reset_index(drop=True), blk5, blk15], axis=1)
     initial = len(combined)
-    combined.dropna(inplace=True)
-    print(f"📊 对齐完成。原始 1m: {initial} 行 -> 有效对齐: {len(combined)} 行")
-    return combined.reset_index(drop=True)
+    combined = combined.dropna().reset_index(drop=True)
+    print(f"📊 聚合完成。原始 1m: {initial} 行 -> 有效: {len(combined)} 行")
+    return combined
 
 
-def create_sliding_windows(df, window_size):
-    data_values = df.drop(columns=["time"]).values.astype(np.float32)
-    total_len = len(data_values)
-    if total_len < window_size:
-        raise ValueError(f"有效数据量 {total_len} 小于窗口大小 {window_size}")
-    num_windows = total_len - window_size + 1
-    shape = (num_windows, window_size, data_values.shape[1])
-    strides = (data_values.strides[0], data_values.strides[0], data_values.strides[1])
-    windows = np.lib.stride_tricks.as_strided(data_values, shape=shape, strides=strides)
-    return windows, num_windows
+def create_multi_scale_windows(df, window_size=WINDOW_SIZE):
+    """每个样本 = 右端对齐同一分钟 t 的三个独立 60 根窗口。
+
+    行 j (0..59, 旧->新)：
+      通道 0-3 : 1m  OHLC @ t-(59-j)
+      通道 4-7 : 5m  滚动块 OHLC，块右端 @ t-(59-j)*5
+      通道 8-11: 15m 滚动块 OHLC，块右端 @ t-(59-j)*15
+    """
+    vals = df.drop(columns=["time"]).values.astype(np.float32)  # (T, 12)
+    T = len(vals)
+    # 15m 窗口回看 15*(window_size-1)；df 已去掉 rolling 头部 NaN(14 行)，合计正好 LOOKBACK
+    min_t = 15 * (window_size - 1)
+    if T <= min_t:
+        raise ValueError(f"有效数据量 {T} 不足以构成一个多尺度窗口（需 >{min_t}）")
+
+    t_end = np.arange(min_t, T)                                  # 每个样本的右端索引
+    back = (window_size - 1 - np.arange(window_size))            # 59..0
+    X = np.empty((len(t_end), window_size, 12), dtype=np.float32)
+    for g, stride in enumerate((1, 5, 15)):                      # 1m / 5m / 15m
+        idx = t_end[:, None] - back[None, :] * stride            # (N, 60)
+        X[:, :, g * 4:(g + 1) * 4] = vals[idx, g * 4:(g + 1) * 4]
+    return X, len(t_end)
 
 
 def run(inst_id="BTC-USDT", max_bars=None,
         output_file="org_v1.npy", csv_file="org_v1.csv"):
     df_1m = fetch_okx_1m(inst_id, max_bars)
-    if df_1m is None or len(df_1m) < WINDOW_SIZE + 1000:
+    # 多尺度回看 900 + 标签前视 900，再留点余量
+    if df_1m is None or len(df_1m) < LOOKBACK * 2 + 200:
         have = 0 if df_1m is None else len(df_1m)
-        print(f"❌ 数据不足（当前 {have} 根，训练至少需 ~1100 根）。")
+        print(f"❌ 数据不足（当前 {have} 根，多尺度训练至少需 ~{LOOKBACK * 2 + 200} 根）。")
         sys.exit(1)
 
-    full_df = build_aligned(df_1m)
+    full_df = build_multi_scale(df_1m)
     try:
-        windows_data, actual_num = create_sliding_windows(full_df, WINDOW_SIZE)
-        np.save(output_file, np.ascontiguousarray(windows_data))  # as_strided 是视图，需转连续
+        windows_data, actual_num = create_multi_scale_windows(full_df)
+        np.save(output_file, np.ascontiguousarray(windows_data))
         full_df.to_csv(csv_file, index=False)
         print("-" * 30)
         print("✅ 数据集构建完成！")
