@@ -54,11 +54,18 @@ def struct_features(X):
 
 
 if __name__ == "__main__":
-    # 自检: 随机窗口 -> 维度与有限性
-    rng = np.random.default_rng(0)
-    base = 100 + np.cumsum(rng.normal(0, 1, (8, 60)), axis=1)
-    X = np.stack([np.stack([base - 0.2, base + 0.5, base - 0.5, base], axis=2)[:, :, i % 4]
-                  for i in range(12)], axis=2)
+    # 跨语言一致性自检: 与 JS 端 structFeatures() 在同一确定性窗口上的输出对拍。
+    # 生成公式两端一致: v[j,k] = sin(j*0.37 + k*1.3)*10 + j*0.05*(k%4) + 100
+    j = np.arange(60)[:, None]
+    k = np.arange(12)[None, :]
+    X = (np.sin(j * 0.37 + k * 1.3) * 10 + j * 0.05 * (k % 4) + 100)[None, :, :]
     F = struct_features(X)
     assert np.isfinite(F).all()
-    print("OK", F.shape)
+    JS_EXPECTED = np.array([
+        1.088944, 1.914758, 0.116667, 0.883333, -0.257343, 3.150646, 1, 0,
+        0.609139, 1.753041, 0.066667, 0.833333, 1.140007, 1.776646, 1, 0,
+        0.351461, 0.955573, 0.016667, 0.8, 1.863379, 1.009814, 1, 0,
+        1.013321], dtype=np.float64)
+    diff = np.abs(F[0].astype(np.float64) - JS_EXPECTED).max()
+    assert diff < 1e-4, f"与 JS 端不一致, max diff = {diff}"
+    print(f"OK {F.shape} | 与 JS structFeatures 最大差异 {diff:.2e}")
