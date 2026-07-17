@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gaf_transform import gasf_batch
 
 def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED_T_MODEL,
+                    DCT_REAL_FILE="../CNN_Transformer/y_transformer_v1.npy",
                     EXTRAS_FILE="ud_extras.npz", epochs=10000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
@@ -19,7 +20,8 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     np.random.seed(42)
 
     print(">>> 加载数据...")
-    y_dct = np.load(DCT_FILE)      # 已经局部标准化后的 DCT 系数(v3: 3 维, 模型1预测值)
+    y_dct = np.load(DCT_FILE)      # 模型1预测的 DCT(条件噪声增强用)
+    y_dct_real = np.load(DCT_REAL_FILE)  # 真实 DCT 标签(teacher forcing 主条件)
     y_delta = np.load(DELTA_FILE)  # 已经局部标准化后的 Delta
     extras = np.load(EXTRAS_FILE)  # v3: fut_close/trend/pivots, zigzag 结构损失用
     fut_close = extras["fut_close"]
@@ -59,6 +61,7 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
 
     X_feat = X_feat[:min_samples]
     y_dct = y_dct[:min_samples]
+    y_dct_real = y_dct_real[:min_samples]
     y_delta = y_delta[:min_samples]
 
     print(f">>> 数据加载完成 | 样本数: {min_samples}")
@@ -72,6 +75,7 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     dataset = TensorDataset(
         torch.from_numpy(X_feat).float(),
         torch.from_numpy(y_dct).float(),
+        torch.from_numpy(y_dct_real).float(),
         torch.from_numpy(y_delta).float(),
         torch.from_numpy(trend_line).float(),
         torch.from_numpy(fut_close).float(),
@@ -100,7 +104,14 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
     criterion = nn.MSELoss()
     STRUCT_LAMBDA = float(os.environ.get("UD_STRUCT_LAMBDA", 0.1))
-    print(f">>> zigzag 结构损失 λ = {STRUCT_LAMBDA}")
+    # 条件噪声增强: 每样本以 COND_MIX 概率用真实 DCT(teacher forcing), 否则用模型1预测——
+    # 主体在干净条件下学画线, 同时对模型1的预测误差鲁棒(推理时条件正是模型1输出)。
+    COND_MIX = float(os.environ.get("UD_COND_MIX", 0.5))
+    print(f">>> zigzag 结构损失 λ = {STRUCT_LAMBDA} | 条件混合 P(真实DCT) = {COND_MIX}")
+
+    def mix_cond(dcts_pred, dcts_real):
+        use_real = (torch.rand(dcts_pred.size(0), 1, device=dcts_pred.device) < COND_MIX).float()
+        return use_real * dcts_real + (1.0 - use_real) * dcts_pred
 
     def struct_loss(x_t, t, pred_noise, trend_b, fut_b, piv_b):
         """一步重构 x0̂ -> 合成幽灵收盘路径, 与真实未来做 zigzag 枢轴锚定 + 总变差匹配。
@@ -134,8 +145,9 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
-        for feats, dcts, deltas, trend_b, fut_b, piv_b in train_loader:
-            feats, dcts, deltas = feats.to(device), dcts.to(device), deltas.to(device)
+        for feats, dcts_p, dcts_r, deltas, trend_b, fut_b, piv_b in train_loader:
+            feats, deltas = feats.to(device), deltas.to(device)
+            dcts = mix_cond(dcts_p.to(device), dcts_r.to(device))
             trend_b, fut_b, piv_b = trend_b.to(device), fut_b.to(device), piv_b.to(device)
             optimizer.zero_grad()
 
@@ -156,7 +168,8 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for feats, dcts, deltas, trend_b, fut_b, piv_b in val_loader:
+            for feats, dcts, dcts_r, deltas, trend_b, fut_b, piv_b in val_loader:
+                # 验证只用模型1预测条件(与推理一致)
                 feats, dcts, deltas = feats.to(device), dcts.to(device), deltas.to(device)
                 trend_b, fut_b, piv_b = trend_b.to(device), fut_b.to(device), piv_b.to(device)
                 t = torch.randint(0, diffuser.timesteps, (feats.size(0),), device=device).long()
