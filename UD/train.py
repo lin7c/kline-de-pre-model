@@ -10,7 +10,8 @@ from UDmodel import DiffusionUNet, GaussianDiffusion
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gaf_transform import gasf_batch
 
-def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED_T_MODEL, epochs=10000):
+def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED_T_MODEL,
+                    EXTRAS_FILE="ud_extras.npz", epochs=10000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -18,8 +19,12 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     np.random.seed(42)
 
     print(">>> 加载数据...")
-    y_dct = np.load(DCT_FILE)      # 已经局部标准化后的 DCT 系数
+    y_dct = np.load(DCT_FILE)      # 已经局部标准化后的 DCT 系数(v3: 3 维, 模型1预测值)
     y_delta = np.load(DELTA_FILE)  # 已经局部标准化后的 Delta
+    extras = np.load(EXTRAS_FILE)  # v3: fut_close/trend/pivots, zigzag 结构损失用
+    fut_close = extras["fut_close"]
+    trend_line = extras["trend"]
+    pivot_mask = extras["pivots"].astype(np.float32)
     min_samples = len(y_delta)
 
     # 特征缓存：缓存名绑定原始窗口与特征提取模型的指纹(大小+修改时间)，
@@ -35,7 +40,7 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
         print(">>> 提取 CNN 特征（GASF 现算）...")
         X_raw = np.load(X_FILE)[:min_samples]
         from Dmodel import GafCnnTransformer
-        t_model = GafCnnTransformer(output_dim=9).to(device)
+        t_model = GafCnnTransformer(output_dim=3).to(device)
         t_ckpt = torch.load(PRETRAINED_T_MODEL, map_location=device, weights_only=False)
         t_model.load_state_dict(t_ckpt.get('model_state_dict', t_ckpt))
         t_model.eval()
@@ -61,10 +66,16 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     print(f">>> y_delta 统计: mean={y_delta.mean():.5f}, std={y_delta.std():.5f}")
 
     # === 不再做全局标准化，直接使用局部标准化后的数据 ===
+    fut_close = fut_close[:min_samples]
+    trend_line = trend_line[:min_samples]
+    pivot_mask = pivot_mask[:min_samples]
     dataset = TensorDataset(
         torch.from_numpy(X_feat).float(),
         torch.from_numpy(y_dct).float(),
-        torch.from_numpy(y_delta).float()
+        torch.from_numpy(y_delta).float(),
+        torch.from_numpy(trend_line).float(),
+        torch.from_numpy(fut_close).float(),
+        torch.from_numpy(pivot_mask).float(),
     )
 
     # 时序切分（同 CNN_Transformer）：按时间顺序切分并留 gap，防止重叠窗口/未来标签泄漏
@@ -88,6 +99,23 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     optimizer = optim.AdamW(model.parameters(), lr=0.0002, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
     criterion = nn.MSELoss()
+    STRUCT_LAMBDA = float(os.environ.get("UD_STRUCT_LAMBDA", 0.1))
+    print(f">>> zigzag 结构损失 λ = {STRUCT_LAMBDA}")
+
+    def struct_loss(x_t, t, pred_noise, trend_b, fut_b, piv_b):
+        """一步重构 x0̂ -> 合成幽灵收盘路径, 与真实未来做 zigzag 枢轴锚定 + 总变差匹配。
+        权重 ᾱ_t: 低噪声步(x0̂ 可信)权重高, 高噪声步权重趋 0。"""
+        ab = diffuser.alphas_cumprod[t].view(-1, 1, 1)
+        x0_hat = (x_t - torch.sqrt(1.0 - ab) * pred_noise) / torch.sqrt(ab.clamp(min=1e-8))
+        ghost = trend_b + x0_hat[:, :, 3]                     # (B,60) 幽灵收盘路径
+        # 枢轴锚定: 只在真实 zigzag 枢轴处比对(教"高低点在哪、多高多低")
+        piv_mse = ((ghost - fut_b) ** 2 * piv_b).sum(1) / piv_b.sum(1).clamp(min=1.0)
+        # 总变差匹配: 折返能量一致(教"高低点之间怎么走")
+        tv_g = (ghost[:, 1:] - ghost[:, :-1]).abs().sum(1)
+        tv_r = (fut_b[:, 1:] - fut_b[:, :-1]).abs().sum(1)
+        tv_pen = (tv_g - tv_r) ** 2 / ghost.size(1)
+        w = diffuser.alphas_cumprod[t]                        # (B,)
+        return (w * (piv_mse + 0.1 * tv_pen)).mean()
 
     best_val_loss = float('inf')
     start_epoch = 0
@@ -106,8 +134,9 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
     for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
-        for feats, dcts, deltas in train_loader:
+        for feats, dcts, deltas, trend_b, fut_b, piv_b in train_loader:
             feats, dcts, deltas = feats.to(device), dcts.to(device), deltas.to(device)
+            trend_b, fut_b, piv_b = trend_b.to(device), fut_b.to(device), piv_b.to(device)
             optimizer.zero_grad()
 
             t = torch.randint(0, diffuser.timesteps, (feats.size(0),), device=device).long()
@@ -115,7 +144,8 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
             x_t = diffuser.sample_q_t(deltas, t, noise)
 
             pred_noise = model(x_t, t, dcts, feats)
-            loss = criterion(pred_noise, noise)
+            loss = criterion(pred_noise, noise) \
+                + STRUCT_LAMBDA * struct_loss(x_t, t, pred_noise, trend_b, fut_b, piv_b)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -126,13 +156,15 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for feats, dcts, deltas in val_loader:
+            for feats, dcts, deltas, trend_b, fut_b, piv_b in val_loader:
                 feats, dcts, deltas = feats.to(device), dcts.to(device), deltas.to(device)
+                trend_b, fut_b, piv_b = trend_b.to(device), fut_b.to(device), piv_b.to(device)
                 t = torch.randint(0, diffuser.timesteps, (feats.size(0),), device=device).long()
                 noise = torch.randn_like(deltas)
                 x_t = diffuser.sample_q_t(deltas, t, noise)
                 pred_noise = model(x_t, t, dcts, feats)
-                val_loss += criterion(pred_noise, noise).item()
+                val_loss += (criterion(pred_noise, noise)
+                             + STRUCT_LAMBDA * struct_loss(x_t, t, pred_noise, trend_b, fut_b, piv_b)).item()
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)

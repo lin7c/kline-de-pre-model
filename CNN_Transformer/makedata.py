@@ -4,6 +4,12 @@ import os
 
 
 def generate_dct_trend_labels(file_path, n_components=3):
+    """v3: 只回归 1m 未来 60 分钟趋势的前 n_components 个 DCT 系数(局部标准化空间)。
+
+    v2 的 9 维(3 周期×3 系数)已改为 3 维: 5m/15m 的趋势输出被砍掉——
+    walk-forward 探针显示 300/900 分钟前向信息更弱, 多任务头徒增拟合目标。
+    保留 total-900 的裁剪跨度, 与 CNN/makedata 的 input_x 对齐。
+    """
     try:
         X_raw = np.load(file_path)
     except FileNotFoundError:
@@ -11,61 +17,25 @@ def generate_dct_trend_labels(file_path, n_components=3):
         return None
 
     total_samples = X_raw.shape[0]
+    gap_align = 900          # 与 input_x 裁剪对齐(管线最大前视跨度)
+    look_ahead = 60          # 1m 趋势预测跨度
+    col_idx = 3              # 1m close
 
-    gap_1m = 60
-    gap_5m = 300
-    gap_15m = 900
-
-    valid_samples = total_samples - gap_15m
-
+    valid_samples = total_samples - gap_align
     if valid_samples <= 0:
-        print(f"数据量太小，无法生成标签")
+        print("数据量太小，无法生成标签")
         return None
 
-    config = [
-        {"col": 3, "gap": gap_1m, "step": 1},
-        {"col": 7, "gap": gap_5m, "step": 5},
-        {"col": 11, "gap": gap_15m, "step": 15}
-    ]
+    closes_end = X_raw[:, -1, col_idx].astype(np.float64)             # 每样本右端收盘 (T,)
+    local_std = X_raw[:, :, col_idx].astype(np.float64).std(axis=1) + 1e-9  # 每窗口 σ (T,)
 
-    y_list = []
-    print(f"开始生成带局部标准化的 DCT 趋势标签...")
-
-    for i in range(valid_samples):
-        sample_all_tf_coeffs = []
-
-        for item in config:
-            col_idx = item["col"]
-            look_ahead = item["gap"]
-            step = item["step"]
-
-            # 1. 提取基准价格
-            base_price = X_raw[i, -1, col_idx]
-
-            # --- 新增：计算局部标准化因子 ---
-            # 使用当前观察窗口 X[i] 的标准差作为缩放基准
-            # 加上 1e-9 防止除零
-            local_std = np.std(X_raw[i, :, col_idx]) + 1e-9
-
-            # 2. 提取未来原始序列并压缩
-            future_series_raw = X_raw[i + 1: i + look_ahead + 1, -1, col_idx]
-            compressed_series = future_series_raw[step - 1::step]
-
-            # 3. --- 修改：执行局部标准化 ---
-            # 原来的：norm_series = compressed_series - base_price
-            # 现在的：(未来价格 - 当前价格) / 历史波动波动
-            norm_series = (compressed_series - base_price) / local_std
-
-            # 4. 执行 DCT 变换
-            coeffs = dct(norm_series, type=2, norm='ortho')
-
-            # 5. 截取前 n_components 个低频系数
-            sample_all_tf_coeffs.append(coeffs[:n_components])
-
-        y_list.append(np.concatenate(sample_all_tf_coeffs))
-
-    y_final = np.array(y_list, dtype=np.float32)
-    return y_final
+    print("开始生成带局部标准化的 DCT 趋势标签(v3: 1m×3 系数)...")
+    idx = np.arange(valid_samples)
+    # 未来 60 根收盘: fut[i, k] = closes_end[i+1+k]
+    fut = closes_end[idx[:, None] + 1 + np.arange(look_ahead)[None, :]]
+    norm = (fut - closes_end[idx, None]) / local_std[idx, None]
+    coeffs = dct(norm, type=2, norm="ortho", axis=1)[:, :n_components]
+    return coeffs.astype(np.float32)
 
 
 def run(X_FILE="../org_v1.npy", Y_FILE="y_transformer_v1.npy"):
@@ -73,6 +43,7 @@ def run(X_FILE="../org_v1.npy", Y_FILE="y_transformer_v1.npy"):
     if y is not None:
         np.save(Y_FILE, y)
         print(f"处理完成！最终 Y 形状: {y.shape}")
+        print(f"Y 统计: mean={y.mean():.4f}, std={y.std():.4f}")
 
 
 if __name__ == "__main__":

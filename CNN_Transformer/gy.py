@@ -6,6 +6,7 @@ from Dmodel import GafCnnTransformer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gaf_transform import gasf_batch
+from struct_feat import struct_features
 
 
 def run_inference(x_path="../CNN/input_x_v1.npy",
@@ -17,7 +18,7 @@ def run_inference(x_path="../CNN/input_x_v1.npy",
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1. 加载模型
-    model = GafCnnTransformer(output_dim=9).to(device)
+    model = GafCnnTransformer(output_dim=3).to(device)
     if not os.path.exists(model_path):
         print(f"错误：找不到模型文件 {model_path}")
         return
@@ -37,7 +38,9 @@ def run_inference(x_path="../CNN/input_x_v1.npy",
         return
 
     X_raw = np.load(x_path)
+    S = struct_features(X_raw)
     X_tensor = torch.from_numpy(X_raw).float()
+    S_tensor = torch.from_numpy(S).float()
 
     # 3. 批量推理
     all_preds = []
@@ -47,7 +50,7 @@ def run_inference(x_path="../CNN/input_x_v1.npy",
     with torch.no_grad():
         for i in range(0, len(X_tensor), batch_size):
             batch_x = gasf_batch(X_tensor[i:i + batch_size].to(device))
-            preds = model(batch_x)
+            preds = model(batch_x, S_tensor[i:i + batch_size].to(device))
             all_preds.append(preds.cpu().numpy())
 
     # 4. 直接合并结果（跳过逆标准化步骤）

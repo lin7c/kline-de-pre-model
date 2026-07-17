@@ -2,14 +2,15 @@
 把训练好的 .pth 导出为 kline-de-pre 可直接加载的 ONNX。
 
 严格匹配 app 的输入输出契约（从 src/utils/transformerService.js / inferenceService.js 逆推）：
-  模型1 transformer_with_feat_merged.onnx:
-    输入 : gaf_input  [N, 12, 60, 60]
-    输出 : dct_output [N, 9]   (原始尺度 DCT 系数)
+  模型1 transformer_with_feat_merged.onnx (v3):
+    输入 : gaf_input    [N, 12, 60, 60]
+           struct_input [N, 25]  (结构特征旁路, JS 端 structFeatures() 计算)
+    输出 : dct_output [N, 3]   (1m 趋势前 3 个 DCT 系数, 局部标准化空间)
            feat_output[N, 128] (CNN 主干 GAP 特征, 供 Diffusion 条件用)
-  模型2 diffusion_unet_merged.onnx:
+  模型2 diffusion_unet_merged.onnx (v3):
     输入 : x   [1, 60, 4] float32   (加噪残差)
            t   [1]        int64     (时间步)
-           dct [1, 9]     float32
+           dct [1, 3]     float32
            feat[1, 128]   float32
     输出 : output_noise [1, 60, 4]  (预测噪声)
 
@@ -35,28 +36,30 @@ class TransformerExport(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, gaf):
-        feat = self.model.extract_feat(gaf)     # (B, 128)  = feat_output
-        dct = self.model.regressor(feat)        # (B, 9)    = dct_output
+    def forward(self, gaf, sfeat):
+        feat = self.model.extract_feat(gaf)                       # (B, 128) = feat_output
+        dct = self.model.regressor(torch.cat([feat, sfeat], 1))   # (B, 3)   = dct_output
         return dct, feat
 
 
 def export_transformer(ckpt_path, out_path):
-    model = GafCnnTransformer(output_dim=9)
+    model = GafCnnTransformer(output_dim=3)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     model.load_state_dict(state)
     model.eval()
 
     wrapper = TransformerExport(model).eval()
-    dummy = torch.zeros(1, 12, 60, 60, dtype=torch.float32)  # CPU 导出，无需 GPU
+    dummy = (torch.zeros(1, 12, 60, 60, dtype=torch.float32),   # CPU 导出，无需 GPU
+             torch.zeros(1, 25, dtype=torch.float32))
 
     torch.onnx.export(
         wrapper, dummy, out_path,
-        input_names=["gaf_input"],
+        input_names=["gaf_input", "struct_input"],
         output_names=["dct_output", "feat_output"],
         dynamic_axes={
             "gaf_input": {0: "batch"},
+            "struct_input": {0: "batch"},
             "dct_output": {0: "batch"},
             "feat_output": {0: "batch"},
         },
@@ -68,15 +71,15 @@ def export_transformer(ckpt_path, out_path):
 
     # 自检输出维度
     with torch.no_grad():
-        dct, feat = wrapper(dummy)
-    print(f"   dct_output shape = {tuple(dct.shape)}  (应为 (1, 9))")
+        dct, feat = wrapper(*dummy)
+    print(f"   dct_output shape = {tuple(dct.shape)}  (应为 (1, 3))")
     print(f"   feat_output shape = {tuple(feat.shape)}  (应为 (1, 128))")
 
 
 def export_diffusion(ckpt_path, out_path):
     from UDmodel import DiffusionUNet   # 延迟导入，避免只导模型1时的依赖
 
-    model = DiffusionUNet(feature_dim=128, dct_dim=9, seq_len=60)
+    model = DiffusionUNet(feature_dim=128, dct_dim=3, seq_len=60)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     model.load_state_dict(state)
@@ -85,7 +88,7 @@ def export_diffusion(ckpt_path, out_path):
     dummy = (
         torch.zeros(1, 60, 4, dtype=torch.float32),   # x
         torch.zeros(1, dtype=torch.int64),            # t
-        torch.zeros(1, 9, dtype=torch.float32),       # dct
+        torch.zeros(1, 3, dtype=torch.float32),       # dct
         torch.zeros(1, 128, dtype=torch.float32),     # feat
     )
     torch.onnx.export(

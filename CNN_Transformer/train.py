@@ -11,6 +11,7 @@ from sklearn.metrics import r2_score
 # GASF 按 batch 现算（不再预存 (N,12,60,60) 大数组，避免内存/磁盘爆炸）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gaf_transform import gasf_batch
+from struct_feat import struct_features
 
 
 def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
@@ -38,15 +39,20 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
     print(
         f">>> Y 统计信息 (应接近 mean≈0, std≈1): mean={np.mean(y):.4f}, std={np.std(y):.4f}, min={np.min(y):.4f}, max={np.max(y):.4f}")
 
+    # 结构特征旁路(v3): 从窗口显式计算 25 维结构表征
+    S = struct_features(X)
+    print(f">>> 结构特征: {S.shape}")
+
     # 直接使用 makedata.py 生成的标准化后的 Y
     X_tensor = torch.from_numpy(X).float()
+    S_tensor = torch.from_numpy(S).float()
     y_tensor = torch.from_numpy(y).float()
 
-    dataset = TensorDataset(X_tensor, y_tensor)
+    dataset = TensorDataset(X_tensor, S_tensor, y_tensor)
     # 时间序列必须按时间顺序切分：样本是重叠滑动窗口且带未来标签，
     # 随机切分会把相邻近乎相同的窗口分到 train/val，造成数据泄漏、验证指标虚高。
     # 切分处再留 LABEL_GAP 个样本的间隔，断开标签向后看造成的重叠。
-    LABEL_GAP = 900  # 标签最大前视跨度(15m×60)
+    LABEL_GAP = 900  # 保守间隔: 输入回看 900(15m×60), 标签前视 60
     n = len(dataset)
     train_size = int(0.8 * n)
     train_idx = list(range(0, train_size))
@@ -90,11 +96,11 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
         # 训练
         model.train()
         train_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, sfeat, labels in train_loader:
+            inputs, sfeat, labels = inputs.to(device), sfeat.to(device), labels.to(device)
             inputs = gasf_batch(inputs)  # (B,60,12) -> (B,12,60,60) 现算
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(inputs, sfeat)
             loss = criterion(outputs, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -106,10 +112,10 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
         val_loss = 0.0
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
+            for inputs, sfeat, labels in val_loader:
+                inputs, sfeat, labels = inputs.to(device), sfeat.to(device), labels.to(device)
                 inputs = gasf_batch(inputs)
-                outputs = model(inputs)
+                outputs = model(inputs, sfeat)
                 val_loss += criterion(outputs, labels).item()
                 all_preds.append(outputs.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
@@ -160,7 +166,7 @@ def run():
         "RESUME": False,  # 换数据集或想重新训练时设为 False；这里默认从零训练 BTC
         "X_FILE": "../CNN/input_x_v1.npy",  # 原始窗口(N,60,12)，GASF 训练时现算
         "Y_FILE": "y_transformer_v1.npy",
-        "output_dim": 9,
+        "output_dim": 3,
         "epochs": int(os.environ.get("CT_EPOCHS", 10000))  # 可用环境变量限制轮次(测试用)
     }
     train_model(**CONFIG)

@@ -27,6 +27,9 @@
   python getdata_btc.py                # 拉到历史尽头（最多）
   python getdata_btc.py 200000         # 最多拉 20 万根 1m
   python getdata_btc.py all BTC-USDT   # 显式拉满 + 指定品种
+  python getdata_btc.py csv <path> [max_bars]  # 离线模式: 从本地/挂载 CSV 读取
+      (无外网的 Kaggle 账号用, 例如 dataset mczielinski/bitcoin-historical-data;
+       CSV 需含 timestamp/open/high/low/close 列, 列名大小写不敏感)
 """
 import sys
 import time
@@ -97,6 +100,29 @@ def fetch_okx_1m(inst_id, max_bars):
     return df
 
 
+def load_csv_1m(csv_path, max_bars=None):
+    """离线模式: 从 CSV 读 1m K 线, 输出与 fetch_okx_1m 相同格式(升序, 1m_* 列)。"""
+    print(f"📂 离线读取: {csv_path}")
+    df = pd.read_csv(csv_path)
+    cols = {k.lower(): k for k in df.columns}
+    tcol = next(cols[k] for k in ("timestamp", "ts", "time", "date", "open time") if k in cols)
+    df = df.sort_values(tcol).dropna(subset=[cols["close"]])
+    if max_bars is not None:
+        df = df.tail(max_bars)
+    ts = df[tcol]
+    time_col = (pd.to_datetime(ts, unit="s", errors="coerce")
+                if np.issubdtype(ts.dtype, np.number) else pd.to_datetime(ts, errors="coerce"))
+    out = pd.DataFrame({
+        "time": time_col.values,
+        "1m_open": df[cols["open"]].astype(float).values,
+        "1m_high": df[cols["high"]].astype(float).values,
+        "1m_low": df[cols["low"]].astype(float).values,
+        "1m_close": df[cols["close"]].astype(float).values,
+    }).dropna().drop_duplicates("time").reset_index(drop=True)
+    print(f"✅ 读取 {len(out)} 根 | {out['time'].iloc[0]} -> {out['time'].iloc[-1]}")
+    return out
+
+
 def trailing_blocks(df_1m, period, prefix):
     """以每根 1m 为右端的 trailing `period` 分钟聚合块（只看当前及更早，无未来函数）。
 
@@ -151,8 +177,8 @@ def create_multi_scale_windows(df, window_size=WINDOW_SIZE):
 
 
 def run(inst_id="BTC-USDT", max_bars=None,
-        output_file="org_v1.npy", csv_file="org_v1.csv"):
-    df_1m = fetch_okx_1m(inst_id, max_bars)
+        output_file="org_v1.npy", csv_file="org_v1.csv", csv_source=None):
+    df_1m = load_csv_1m(csv_source, max_bars) if csv_source else fetch_okx_1m(inst_id, max_bars)
     # 多尺度回看 900 + 标签前视 900，再留点余量
     if df_1m is None or len(df_1m) < LOOKBACK * 2 + 200:
         have = 0 if df_1m is None else len(df_1m)
@@ -178,13 +204,19 @@ def run(inst_id="BTC-USDT", max_bars=None,
 def _parse_args(argv):
     max_bars = None      # 默认拉满
     inst_id = "BTC-USDT"
+    csv_source = None
+    if len(argv) > 1 and argv[1].lower() == "csv":
+        csv_source = argv[2]
+        if len(argv) > 3:
+            max_bars = int(argv[3])
+        return inst_id, max_bars, csv_source
     if len(argv) > 1 and argv[1].lower() not in ("all", "max", "full"):
         max_bars = int(argv[1])
     if len(argv) > 2:
         inst_id = argv[2]
-    return inst_id, max_bars
+    return inst_id, max_bars, csv_source
 
 
 if __name__ == "__main__":
-    inst, mb = _parse_args(sys.argv)
-    run(inst_id=inst, max_bars=mb)
+    inst, mb, csvp = _parse_args(sys.argv)
+    run(inst_id=inst, max_bars=mb, csv_source=csvp)

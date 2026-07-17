@@ -39,7 +39,7 @@ class ResidualBlock1D(nn.Module):
 
 
 class DiffusionUNet(nn.Module):
-    def __init__(self, feature_dim=128, dct_dim=9, seq_len=60):
+    def __init__(self, feature_dim=128, dct_dim=3, seq_len=60):  # v3: dct 3 维
         super().__init__()
         self.seq_len = seq_len
 
