@@ -47,5 +47,16 @@ class GafCnnTransformer(nn.Module):
         return F.adaptive_avg_pool2d(f, 1).flatten(1)   # (B, 128)
 
     def forward(self, x, sfeat):
-        """x: GAF (B,12,60,60); sfeat: 结构特征 (B,25) -> dct (B,3)"""
+        """x: GAF (B,12,60,60); sfeat: 结构特征 (B,25) -> (B, output_dim)"""
         return self.regressor(torch.cat([self.extract_feat(x), sfeat], dim=1))
+
+    @staticmethod
+    def from_checkpoint(path, map_location="cpu"):
+        """从 checkpoint 加载, 自动推断 output_dim(3=v3回归 / 9=v4分位数)。"""
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        out_dim, in_dim = state["regressor.weight"].shape
+        m = GafCnnTransformer(output_dim=out_dim, struct_dim=in_dim - 128)
+        m.load_state_dict(state)
+        return m
+

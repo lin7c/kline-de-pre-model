@@ -42,9 +42,7 @@ def train_diffusion(MODEL_PATH, RESUME, X_FILE, DCT_FILE, DELTA_FILE, PRETRAINED
         print(">>> 提取 CNN 特征（GASF 现算）...")
         X_raw = np.load(X_FILE)[:min_samples]
         from Dmodel import GafCnnTransformer
-        t_model = GafCnnTransformer(output_dim=3).to(device)
-        t_ckpt = torch.load(PRETRAINED_T_MODEL, map_location=device, weights_only=False)
-        t_model.load_state_dict(t_ckpt.get('model_state_dict', t_ckpt))
+        t_model = GafCnnTransformer.from_checkpoint(PRETRAINED_T_MODEL, map_location=device).to(device)
         t_model.eval()
 
         all_feats = []

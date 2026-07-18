@@ -51,9 +51,7 @@ def run(X_FILE="../CNN/input_x_v1.npy",
     print(f">>> 样本 {n} | 上涨占比 {d_label.mean():.4f}")
 
     # 冻结主干
-    backbone = GafCnnTransformer(output_dim=3).to(device)
-    ckpt = torch.load(BACKBONE, map_location=device, weights_only=False)
-    backbone.load_state_dict(ckpt.get("model_state_dict", ckpt))
+    backbone = GafCnnTransformer.from_checkpoint(BACKBONE, map_location=device).to(device)
     backbone.eval()
 
     S = struct_features(X)                                # (N,25)

@@ -70,7 +70,16 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
     model = GafCnnTransformer(output_dim=output_dim).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)  # 加大 weight_decay 抑制过拟合(P0-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
-    criterion = nn.HuberLoss(delta=1.0)  # 在标准化空间建议使用 1.0 左右
+
+    # v4 分位数回归(pinball loss): 输出 9 维 = [q10×3系数, q50×3, q90×3]
+    #   - 厚尾免疫: 极端样本梯度恒定(类 L1), 不绑架训练
+    #   - q10/q90 直接学出尾部行为 -> 显示端区间带
+    TAUS = torch.tensor([0.1, 0.5, 0.9], device=device).view(1, 3, 1)
+
+    def criterion(pred, target):
+        p = pred.view(-1, 3, 3)          # (B, τ, coeff)
+        diff = target.unsqueeze(1) - p    # (B, 3, 3)
+        return torch.mean(torch.maximum(TAUS * diff, (TAUS - 1) * diff))
 
     best_val_loss = float('inf')
     start_epoch = 0
@@ -123,15 +132,18 @@ def train_model(MODEL_PATH, RESUME, X_FILE, Y_FILE, output_dim=9, epochs=10000):
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
 
-        # 在标准化后的 DCT 空间计算 R²（干净且合理）
+        # q50 的 R² + 分位覆盖率(校准好则 P(y<q10)≈0.10, P(y<q90)≈0.90)
         y_true = np.concatenate(all_labels, axis=0)
-        y_pred = np.concatenate(all_preds, axis=0)
-        current_r2 = r2_score(y_true, y_pred)
+        y_pred9 = np.concatenate(all_preds, axis=0).reshape(-1, 3, 3)
+        current_r2 = r2_score(y_true, y_pred9[:, 1, :])
+        cov10 = float((y_true < y_pred9[:, 0, :]).mean())
+        cov90 = float((y_true < y_pred9[:, 2, :]).mean())
 
         scheduler.step(avg_val_loss)
 
         print(f"Epoch [{epoch + 1:03d}/{epochs}] | LR: {optimizer.param_groups[0]['lr']:.7f} | "
-              f"Loss(T/V): {avg_train_loss:.5f}/{avg_val_loss:.5f} | R²: {current_r2:.4f}")
+              f"Loss(T/V): {avg_train_loss:.5f}/{avg_val_loss:.5f} | q50 R²: {current_r2:.4f} | "
+              f"覆盖 q10/q90: {cov10:.3f}/{cov90:.3f}")
 
         # 保存最佳模型
         if avg_val_loss < best_val_loss:
@@ -166,7 +178,7 @@ def run():
         "RESUME": False,  # 换数据集或想重新训练时设为 False；这里默认从零训练 BTC
         "X_FILE": "../CNN/input_x_v1.npy",  # 原始窗口(N,60,12)，GASF 训练时现算
         "Y_FILE": "y_transformer_v1.npy",
-        "output_dim": 3,
+        "output_dim": 9,  # v4: [q10,q50,q90]×3系数
         "epochs": int(os.environ.get("CT_EPOCHS", 10000))  # 可用环境变量限制轮次(测试用)
     }
     train_model(**CONFIG)

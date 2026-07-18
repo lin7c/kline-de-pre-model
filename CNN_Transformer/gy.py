@@ -18,17 +18,10 @@ def run_inference(x_path="../CNN/input_x_v1.npy",
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1. 加载模型
-    model = GafCnnTransformer(output_dim=3).to(device)
     if not os.path.exists(model_path):
         print(f"错误：找不到模型文件 {model_path}")
         return
-
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-
+    model = GafCnnTransformer.from_checkpoint(model_path, map_location=device).to(device)
     model.eval()
     print(f">>> 模型加载成功: {model_path}")
 
@@ -53,8 +46,11 @@ def run_inference(x_path="../CNN/input_x_v1.npy",
             preds = model(batch_x, S_tensor[i:i + batch_size].to(device))
             all_preds.append(preds.cpu().numpy())
 
-    # 4. 直接合并结果（跳过逆标准化步骤）
+    # 4. 合并结果; v4 分位数模型(9维)时取 q50 段(3维)作为 UD 的 dct 条件
     y_final = np.concatenate(all_preds, axis=0)
+    if y_final.shape[1] == 9:
+        y_final = y_final[:, 3:6]
+        print(">>> v4 分位数输出, 取 q50 段作为 UD 条件")
 
     # 保存
     np.save(save_path, y_final)

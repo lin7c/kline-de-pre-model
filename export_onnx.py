@@ -132,6 +132,65 @@ def export_direction(backbone_ckpt, head_ckpt, out_path):
     print(f"   dct_output {tuple(dct.shape)} (1,3) | feat_output {tuple(feat.shape)} (1,128)")
 
 
+class QuantileDirectionExport(nn.Module):
+    """v4 模型1: 方向头合成中线 + 分位数区间带(厚尾)。
+
+    输出:
+      dct_output [B,3]  = p·c_up + (1-p)·c_dn   (方向合成中线, 契约不变, 供显示与 diffusion)
+      feat_output[B,128]
+      band_low   [B,3]  = q10 系数(悲观路径, IDCT 后为区间带下沿)
+      band_high  [B,3]  = q90 系数(乐观路径, 区间带上沿)
+    q10/q50/q90 逐维排序保证不交叉。
+    """
+    def __init__(self, backbone, head, mu, sd, c_up, c_dn):
+        super().__init__()
+        self.backbone = backbone         # 分位数回归模型(regressor 输出 9 维)
+        self.head = head
+        self.register_buffer("mu", mu)
+        self.register_buffer("sd", sd)
+        self.register_buffer("c_up", c_up)
+        self.register_buffer("c_dn", c_dn)
+
+    def forward(self, gaf, sfeat):
+        feat = self.backbone.extract_feat(gaf)                    # (B,128)
+        z = torch.cat([feat, sfeat], 1)
+        q = self.backbone.regressor(z).view(-1, 3, 3)             # (B, τ, coeff)
+        q, _ = torch.sort(q, dim=1)                               # 防分位交叉
+        p = torch.sigmoid(self.head((z - self.mu) / self.sd))     # (B,1)
+        dct = p * self.c_up + (1.0 - p) * self.c_dn               # 方向合成中线
+        return dct, feat, q[:, 0, :], q[:, 2, :]                  # dct, feat, band_low, band_high
+
+
+def export_v4(backbone_ckpt, head_ckpt, out_path):
+    backbone = GafCnnTransformer.from_checkpoint(backbone_ckpt)
+    assert backbone.regressor.out_features == 9, "v4 需要分位数模型(9 维输出)"
+    backbone.eval()
+    d = torch.load(head_ckpt, map_location="cpu", weights_only=False)
+    head = nn.Linear(len(d["feat_mu"]), 1)
+    head.load_state_dict(d["head_state"])
+    wrapper = QuantileDirectionExport(
+        backbone, head,
+        torch.from_numpy(d["feat_mu"]), torch.from_numpy(d["feat_sd"]),
+        torch.from_numpy(d["c_up"]), torch.from_numpy(d["c_dn"]),
+    ).eval()
+    print(f">>> 方向头 val AUC={d.get('val_auc'):.4f} | c_up={d['c_up'].round(2)} c_dn={d['c_dn'].round(2)}")
+
+    dummy = (torch.zeros(1, 12, 60, 60, dtype=torch.float32),
+             torch.zeros(1, 25, dtype=torch.float32))
+    torch.onnx.export(
+        wrapper, dummy, out_path,
+        input_names=["gaf_input", "struct_input"],
+        output_names=["dct_output", "feat_output", "band_low", "band_high"],
+        dynamic_axes={n: {0: "batch"} for n in
+                      ["gaf_input", "struct_input", "dct_output", "feat_output", "band_low", "band_high"]},
+        opset_version=17, do_constant_folding=True, dynamo=False,
+    )
+    print(f"✅ 已导出(v4 方向中线+分位数带): {out_path}")
+    with torch.no_grad():
+        dct, feat, lo, hi = wrapper(*dummy)
+    print(f"   dct {tuple(dct.shape)} | feat {tuple(feat.shape)} | band_low {tuple(lo.shape)} | band_high {tuple(hi.shape)}")
+
+
 def export_diffusion(ckpt_path, out_path):
     from UDmodel import DiffusionUNet   # 延迟导入，避免只导模型1时的依赖
 
@@ -164,7 +223,12 @@ def export_diffusion(ckpt_path, out_path):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--direction":
+    if args and args[0] == "--v4":
+        bk = args[1] if len(args) > 1 else os.path.join(HERE, "checkpoints", "transformer_dct_v1.pth")
+        hd = args[2] if len(args) > 2 else os.path.join(HERE, "CNN_Transformer", "direction_head_v1.pth")
+        out = args[3] if len(args) > 3 else os.path.join(HERE, "transformer_with_feat_merged.onnx")
+        export_v4(bk, hd, out)
+    elif args and args[0] == "--direction":
         bk = args[1] if len(args) > 1 else os.path.join(HERE, "checkpoints", "transformer_dct_v1.pth")
         hd = args[2] if len(args) > 2 else os.path.join(HERE, "CNN_Transformer", "direction_head_v1.pth")
         out = args[3] if len(args) > 3 else os.path.join(HERE, "transformer_with_feat_merged.onnx")
