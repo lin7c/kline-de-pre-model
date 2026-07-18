@@ -76,6 +76,62 @@ def export_transformer(ckpt_path, out_path):
     print(f"   feat_output shape = {tuple(feat.shape)}  (应为 (1, 128))")
 
 
+class DirectionExport(nn.Module):
+    """v3.1 方向头版模型1: dct = p·c_up + (1-p)·c_dn, 契约与回归版完全一致。
+
+    内部: feat=CNN GAP(128); z=(cat(feat,sfeat)-mu)/sd; p=sigmoid(head(z));
+          dct_output = p*c_up + (1-p)*c_dn; feat_output = feat(不变, 供 diffusion)。
+    """
+    def __init__(self, backbone, head, mu, sd, c_up, c_dn):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        self.register_buffer("mu", mu)
+        self.register_buffer("sd", sd)
+        self.register_buffer("c_up", c_up)
+        self.register_buffer("c_dn", c_dn)
+
+    def forward(self, gaf, sfeat):
+        feat = self.backbone.extract_feat(gaf)                    # (B,128) = feat_output
+        z = (torch.cat([feat, sfeat], 1) - self.mu) / self.sd
+        p = torch.sigmoid(self.head(z))                           # (B,1)
+        dct = p * self.c_up + (1.0 - p) * self.c_dn               # (B,3) = dct_output
+        return dct, feat
+
+
+def export_direction(backbone_ckpt, head_ckpt, out_path):
+    backbone = GafCnnTransformer(output_dim=3)
+    ckpt = torch.load(backbone_ckpt, map_location="cpu", weights_only=False)
+    backbone.load_state_dict(ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt)
+    backbone.eval()
+
+    d = torch.load(head_ckpt, map_location="cpu", weights_only=False)
+    head = nn.Linear(len(d["feat_mu"]), 1)
+    head.load_state_dict(d["head_state"])
+    wrapper = DirectionExport(
+        backbone, head,
+        torch.from_numpy(d["feat_mu"]), torch.from_numpy(d["feat_sd"]),
+        torch.from_numpy(d["c_up"]), torch.from_numpy(d["c_dn"]),
+    ).eval()
+    print(f">>> head val AUC={d.get('val_auc'):.4f} acc={d.get('val_acc'):.4f} | "
+          f"c_up={d['c_up'].round(2)} c_dn={d['c_dn'].round(2)}")
+
+    dummy = (torch.zeros(1, 12, 60, 60, dtype=torch.float32),
+             torch.zeros(1, 25, dtype=torch.float32))
+    torch.onnx.export(
+        wrapper, dummy, out_path,
+        input_names=["gaf_input", "struct_input"],
+        output_names=["dct_output", "feat_output"],
+        dynamic_axes={"gaf_input": {0: "batch"}, "struct_input": {0: "batch"},
+                      "dct_output": {0: "batch"}, "feat_output": {0: "batch"}},
+        opset_version=17, do_constant_folding=True, dynamo=False,
+    )
+    print(f"✅ 已导出(方向合成版): {out_path}")
+    with torch.no_grad():
+        dct, feat = wrapper(*dummy)
+    print(f"   dct_output {tuple(dct.shape)} (1,3) | feat_output {tuple(feat.shape)} (1,128)")
+
+
 def export_diffusion(ckpt_path, out_path):
     from UDmodel import DiffusionUNet   # 延迟导入，避免只导模型1时的依赖
 
@@ -108,7 +164,12 @@ def export_diffusion(ckpt_path, out_path):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--diffusion":
+    if args and args[0] == "--direction":
+        bk = args[1] if len(args) > 1 else os.path.join(HERE, "checkpoints", "transformer_dct_v1.pth")
+        hd = args[2] if len(args) > 2 else os.path.join(HERE, "CNN_Transformer", "direction_head_v1.pth")
+        out = args[3] if len(args) > 3 else os.path.join(HERE, "transformer_with_feat_merged.onnx")
+        export_direction(bk, hd, out)
+    elif args and args[0] == "--diffusion":
         ckpt = args[1] if len(args) > 1 else os.path.join(HERE, "checkpoints", "diffusion_delta_v1.pth")
         out = args[2] if len(args) > 2 else os.path.join(HERE, "diffusion_unet_merged.onnx")
         export_diffusion(ckpt, out)
